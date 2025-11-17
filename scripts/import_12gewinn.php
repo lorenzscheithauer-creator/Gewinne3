@@ -1,9 +1,6 @@
 <?php
 declare(strict_types=1);
 
-// Hinweis: Damit endet_am ohne Uhrzeit gespeichert wird, sollte die Spalte als DATE geführt werden.
-// Beispiel: ALTER TABLE gewinnspiele MODIFY COLUMN endet_am DATE NULL;
-
 const DB_HOST = 'localhost';
 const DB_NAME = 'gewinne3';
 const DB_USER = 'root';
@@ -23,8 +20,10 @@ function string_starts_with(string $haystack, string $needle): bool
     return strncmp($haystack, $needle, strlen($needle)) === 0;
 }
 
-class SupergewinneImporter
+class TwelveGewinnImporter
 {
+    private const BASE_URL = 'https://www.12gewinn.de/';
+
     private PDO $pdo;
     private array $visitedListings = [];
     private array $stats = [
@@ -54,24 +53,26 @@ class SupergewinneImporter
 
     private function collectEntryPoints(): array
     {
-        $entryPoints = [
-            'https://www.supergewinne.de/',
-            'https://www.supergewinne.de/gewinnspiele/',
-        ];
-
-        $xpath = $this->fetchHtml('https://www.supergewinne.de/');
-        if ($xpath !== null) {
-            $nodes = $xpath->query("//nav[contains(@class,'menu') or contains(@class,'navigation')]//a[contains(@href,'/gewinnspiele/')]");
-            if ($nodes) {
-                foreach ($nodes as $node) {
-                    $href = $node->getAttribute('href');
-                    if (!$href) {
-                        continue;
-                    }
-                    $absolute = $this->makeAbsolute('https://www.supergewinne.de/', $href);
-                    if ($absolute && !in_array($absolute, $entryPoints, true)) {
-                        $entryPoints[] = $absolute;
-                    }
+        $entryPoints = [self::BASE_URL];
+        $xpath = $this->fetchHtml(self::BASE_URL);
+        if ($xpath === null) {
+            return $entryPoints;
+        }
+        $nodes = $xpath->query("//a[contains(@href,'gewinnspiel') or contains(@href,'gewinnspiele')]|
+            //nav//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'gewinn')]");
+        if ($nodes) {
+            foreach ($nodes as $node) {
+                $href = $node->getAttribute('href');
+                if (!$href) {
+                    continue;
+                }
+                $absolute = $this->makeAbsolute(self::BASE_URL, $href);
+                if (!$absolute) {
+                    continue;
+                }
+                $host = parse_url($absolute, PHP_URL_HOST);
+                if ($host && strpos($host, '12gewinn.de') !== false && !in_array($absolute, $entryPoints, true)) {
+                    $entryPoints[] = $absolute;
                 }
             }
         }
@@ -111,7 +112,7 @@ class SupergewinneImporter
 
     private function processListing(string $listingUrl, DOMXPath $xpath): void
     {
-        $nodes = $xpath->query("//a[contains(translate(normalize-space(text()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'mehr lesen')]");
+        $nodes = $xpath->query("//a[contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'zum gewinnspiel')]");
         if (!$nodes) {
             return;
         }
@@ -122,6 +123,10 @@ class SupergewinneImporter
             }
             $detailUrl = $this->makeAbsolute($listingUrl, $href);
             if (!$detailUrl) {
+                continue;
+            }
+            $host = parse_url($detailUrl, PHP_URL_HOST);
+            if (!$host || strpos($host, '12gewinn.de') === false) {
                 continue;
             }
             $this->handleDetail($detailUrl);
@@ -142,15 +147,9 @@ class SupergewinneImporter
             $this->stats['skipped']++;
             return;
         }
-        $actionLink = $this->findActionLink($xpath, $detailUrl);
-        if (!$actionLink) {
-            output_line('[ERROR] Kein Mitmach-Link gefunden bei: ' . $detailUrl);
-            $this->stats['skipped']++;
-            return;
-        }
-        $externalUrl = $this->resolveExternalUrl($actionLink);
+        $externalUrl = $this->findExternalUrl($xpath, $detailUrl);
         if (!$externalUrl) {
-            output_line('[ERROR] Externe URL konnte nicht aufgelöst werden: ' . $actionLink);
+            output_line('[ERROR] Kein externer Link gefunden bei: ' . $detailUrl);
             $this->stats['skipped']++;
             return;
         }
@@ -161,16 +160,23 @@ class SupergewinneImporter
 
     private function extractEndDate(DOMXPath $xpath): ?DateTime
     {
+        $nodes = $xpath->query("//*[contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜß', 'abcdefghijklmnopqrstuvwxyzäöüß'), 'einsendeschluss') or contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜß', 'abcdefghijklmnopqrstuvwxyzäöüß'), 'einsendeschluß')]");
+        if ($nodes) {
+            foreach ($nodes as $node) {
+                $text = trim($node->textContent ?? '');
+                if ($text && preg_match('/(\d{1,2}\.\d{1,2}\.\d{4})/', $text, $matches)) {
+                    $date = DateTime::createFromFormat('d.m.Y', $matches[1]);
+                    if ($date instanceof DateTime) {
+                        $date->setTime(0, 0, 0);
+                        return $date;
+                    }
+                }
+            }
+        }
         $doc = $xpath->document;
         $html = $doc instanceof DOMDocument ? $doc->saveHTML() : '';
-        if (!$html) {
-            return null;
-        }
-        if (!preg_match_all('/(\d{1,2}\.\d{1,2}\.\d{4})/', $html, $matches)) {
-            return null;
-        }
-        foreach ($matches[1] as $dateString) {
-            $date = DateTime::createFromFormat('d.m.Y', $dateString);
+        if ($html && preg_match('/(\d{1,2}\.\d{1,2}\.\d{4})/', $html, $matches)) {
+            $date = DateTime::createFromFormat('d.m.Y', $matches[1]);
             if ($date instanceof DateTime) {
                 $date->setTime(0, 0, 0);
                 return $date;
@@ -179,34 +185,27 @@ class SupergewinneImporter
         return null;
     }
 
-    private function findActionLink(DOMXPath $xpath, string $baseUrl): ?string
+    private function findExternalUrl(DOMXPath $xpath, string $detailUrl): ?string
     {
-        $nodes = $xpath->query("//a[contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'jetzt direkt mitmachen') or contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'zum gewinnspiel')]");
+        $nodes = $xpath->query("//a[contains(translate(normalize-space(string()), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ', 'abcdefghijklmnopqrstuvwxyzäöü'), 'zum gewinnspiel')]");
         if (!$nodes || !$nodes->length) {
             return null;
         }
-        $href = $nodes->item(0)->getAttribute('href');
-        return $this->makeAbsolute($baseUrl, $href);
-    }
-
-    private function resolveExternalUrl(string $url): ?string
-    {
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; SupergewinneImporter/1.0)',
-        ]);
-        curl_exec($ch);
-        if (curl_errno($ch)) {
-            curl_close($ch);
-            return null;
+        foreach ($nodes as $node) {
+            $href = $node->getAttribute('href');
+            if (!$href) {
+                continue;
+            }
+            $absolute = $this->makeAbsolute($detailUrl, $href);
+            if (!$absolute) {
+                continue;
+            }
+            $resolved = $this->resolveExternalUrl($absolute);
+            if ($resolved) {
+                return $resolved;
+            }
         }
-        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        curl_close($ch);
-        return $effectiveUrl ?: null;
+        return null;
     }
 
     private function saveGewinnspiel(string $externalUrl, DateTime $endDate, string $status): array
@@ -242,10 +241,24 @@ class SupergewinneImporter
         return ['message' => '[OK] Eingefügt'];
     }
 
-    private function determineStatus(DateTime $endDate): string
+    private function resolveExternalUrl(string $url): ?string
     {
-        $today = new DateTime('today');
-        return ($endDate < $today) ? 'Ende' : 'Aktiv';
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; 12GewinnImporter/1.0)',
+        ]);
+        curl_exec($ch);
+        if (curl_errno($ch)) {
+            curl_close($ch);
+            return null;
+        }
+        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        curl_close($ch);
+        return $effectiveUrl ?: null;
     }
 
     private function fetchHtml(string $url): ?DOMXPath
@@ -256,7 +269,7 @@ class SupergewinneImporter
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS => 10,
             CURLOPT_TIMEOUT => 30,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; SupergewinneImporter/1.0)',
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; 12GewinnImporter/1.0)',
         ]);
         $body = curl_exec($ch);
         if ($body === false) {
@@ -306,10 +319,16 @@ class SupergewinneImporter
         }
         return $abs;
     }
+
+    private function determineStatus(DateTime $endDate): string
+    {
+        $today = new DateTime('today');
+        return ($endDate < $today) ? 'Ende' : 'Aktiv';
+    }
 }
 
 try {
-    $importer = new SupergewinneImporter();
+    $importer = new TwelveGewinnImporter();
     $importer->run();
 } catch (Throwable $e) {
     output_line('Fehler: ' . $e->getMessage());
